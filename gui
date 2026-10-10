@@ -1,0 +1,325 @@
+Here is a custom, modern JUCE GUI step-sequencer editor component (`SequencerGridComponent`) that gives you visual control over 16-step patterns, roll subdivisions (32nd, 64th, triplets), dynamic pitch sweep curves, and per-step panning.
+
+---
+
+## 1. GUI Component Architecture & Layout
+
+The UI uses a two-tier control structure per step:
+
+1. **Grid Step Button:** Toggles step activation, displays velocity via brightness, and shows a badge for active roll subdivisions.
+2. **Step Inspector Drawer / Overlay:** Opens on step click to visually adjust **Pitch Start/End (-12 to +12 semitones)**, **Pitch Curve shape**, **Pan Spread**, and **Roll Type**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          PERCUSSION PROGRAMMER                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│ [ Step Sequencer Grid ]                                                 │
+│  [1]   [2]   [3]   [4] | [5]   [6]   [7]   [8] | [9]  [10]  [11]  [12]   │
+│  [●]   [○]   [●]   [○] | [●]   [●]   [○]   [●] | [●]   [○]   [●]   [○]   │
+│  32nd        64thT       Pan                      32ndT                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│ [ Active Step Inspector - Step 3 ]                                      │
+│  Roll Type: [ 1/64th Triplet ▼ ]     Curve: [ Logarithmic ▼ ]          │
+│  Pitch Start: [====|====] (-12st)   Pitch End: [=======|==] (+7st)     │
+│  Pan Start:   [===|=====] (L 50%)    Pan End:   [=====|===] (R 50%)    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## 2. Interactive Single-Step GUI Button (`StepButton.h`)
+
+Custom JUCE `Button` sub-class rendering velocity heatmaps and roll badges.
+
+```cpp
+#pragma once
+#include <JuceHeader.h>
+#include "Engine/RollData.h"
+
+namespace PercussionUI
+{
+    class StepButton : public juce::Button
+    {
+    public:
+        StepButton(int stepIdx) 
+            : juce::Button("Step_" + juce::String(stepIdx)), stepIndex(stepIdx)
+        {
+            setClickingTogglesState(true);
+        }
+
+        void setStepData(bool isActive, float velocity, PercussionEngine::RollType rollType)
+        {
+            setToggleState(isActive, juce::dontSendNotification);
+            currentVelocity = velocity;
+            currentRollType = rollType;
+            repaint();
+        }
+
+        int getStepIndex() const { return stepIndex; }
+
+        void paintButton(juce::Graphics& g, bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override
+        {
+            auto bounds = getLocalBounds().toFloat().reduced(2.0f);
+            
+            // Base background
+            juce::Colour baseColor = getToggleState() 
+                ? juce::Colour(0xff00e5ff).withAlpha(0.3f + 0.7f * currentVelocity) // Cyan active fill
+                : juce::Colour(0xff1e222b);                                         // Dark inactive fill
+
+            if (shouldDrawButtonAsHighlighted)
+                baseColor = baseColor.brighter(0.2f);
+
+            g.setColour(baseColor);
+            g.fillRoundedRectangle(bounds, 6.0f);
+
+            // Border
+            g.setColour(getToggleState() ? juce::Colour(0xff00e5ff) : juce::Colour(0xff3a4252));
+            g.drawRoundedRectangle(bounds, 6.0f, getToggleState() ? 2.0f : 1.0f);
+
+            // Step Number
+            g.setColour(getToggleState() ? juce::Colours::white : juce::Colour(0xff8a94a6));
+            g.setFont(juce::FontOptions(12.0f, juce::Font::Bold));
+            g.drawText(juce::String(stepIndex + 1), bounds.removeFromTop(16.0f), juce::Justification::centred);
+
+            // Roll Badge Label
+            if (currentRollType != PercussionEngine::RollType::None)
+            {
+                juce::String badgeText = getRollBadgeText(currentRollType);
+                auto badgeBounds = bounds.removeFromBottom(14.0f).reduced(2.0f, 0.0f);
+                
+                g.setColour(juce::Colour(0xffff0055)); // Hot pink roll badge
+                g.fillRoundedRectangle(badgeBounds, 3.0f);
+
+                g.setColour(juce::Colours::white);
+                g.setFont(juce::FontOptions(9.0f, juce::Font::Bold));
+                g.drawText(badgeText, badgeBounds, juce::Justification::centred);
+            }
+        }
+
+    private:
+        juce::String getRollBadgeText(PercussionEngine::RollType type)
+        {
+            switch (type)
+            {
+                case PercussionEngine::RollType::Straight_32nd: return "32nd";
+                case PercussionEngine::RollType::Straight_64th: return "64th";
+                case PercussionEngine::RollType::Triplet_32ndT: return "32T";
+                case PercussionEngine::RollType::Triplet_64thT: return "64T";
+                default: return "";
+            }
+        }
+
+        int stepIndex;
+        float currentVelocity = 0.8f;
+        PercussionEngine::RollType currentRollType = PercussionEngine::RollType::None;
+    };
+}
+
+```
+
+---
+
+## 3. Step Pitch Sweep & Roll Inspector Component (`StepInspectorComponent.h`)
+
+This panel controls the fine parameters for whichever step is currently selected.
+
+```cpp
+#pragma once
+#include <JuceHeader.h>
+#include "Engine/RollData.h"
+
+namespace PercussionUI
+{
+    class StepInspectorComponent : public juce::Component
+    {
+    public:
+        std::function<void(const PercussionEngine::StepRollConfig&)> onConfigChanged;
+
+        StepInspectorComponent()
+        {
+            // Roll Type Selector
+            rollTypeBox.addItem("No Roll (Single Hit)", 1);
+            rollTypeBox.addItem("1/32nd Straight", 2);
+            rollTypeBox.addItem("1/64th Straight", 3);
+            rollTypeBox.addItem("1/32nd Triplet (1/48)", 4);
+            rollTypeBox.addItem("1/64th Triplet (1/96)", 5);
+            rollTypeBox.setSelectedId(1);
+            rollTypeBox.onChange = [this] { updateConfig(); };
+            addAndMakeVisible(rollTypeBox);
+
+            // Pitch Curve Selector
+            pitchCurveBox.addItem("Linear Sweep", 1);
+            pitchCurveBox.addItem("Exponential Sweep", 2);
+            pitchCurveBox.addItem("Logarithmic Sweep", 3);
+            pitchCurveBox.setSelectedId(1);
+            pitchCurveBox.onChange = [this] { updateConfig(); };
+            addAndMakeVisible(pitchCurveBox);
+
+            // Pitch Sliders (-12 to +12 semitones)
+            setupSlider(startPitchSlider, -12.0f, 12.0f, 0.0f, "st");
+            setupSlider(endPitchSlider, -12.0f, 12.0f, 0.0f, "st");
+
+            // Pan Sliders (-1.0 to +1.0)
+            setupSlider(panStartSlider, -1.0f, 1.0f, 0.0f, "");
+            setupSlider(panEndSlider, -1.0f, 1.0f, 0.0f, "");
+        }
+
+        void inspectStep(int stepIndex, const PercussionEngine::StepRollConfig& config)
+        {
+            selectedStep = stepIndex;
+            currentConfig = config;
+
+            rollTypeBox.setSelectedId(static_cast<int>(config.type) + 1, juce::dontSendNotification);
+            pitchCurveBox.setSelectedId(static_cast<int>(config.pitchCurve) + 1, juce::dontSendNotification);
+
+            startPitchSlider.setValue(config.startPitchOffset, juce::dontSendNotification);
+            endPitchSlider.setValue(config.endPitchOffset, juce::dontSendNotification);
+            panStartSlider.setValue(config.panStart, juce::dontSendNotification);
+            panEndSlider.setValue(config.panEnd, juce::dontSendNotification);
+
+            repaint();
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced(8);
+            auto topRow = area.removeFromTop(28);
+
+            rollTypeBox.setBounds(topRow.removeFromLeft(180));
+            topRow.removeFromLeft(12);
+            pitchCurveBox.setBounds(topRow.removeFromLeft(180));
+
+            area.removeFromTop(8);
+            auto pitchRow = area.removeFromTop(40);
+            startPitchSlider.setBounds(pitchRow.removeFromLeft(200));
+            pitchRow.removeFromLeft(12);
+            endPitchSlider.setBounds(pitchRow.removeFromLeft(200));
+
+            area.removeFromTop(8);
+            auto panRow = area.removeFromTop(40);
+            panStartSlider.setBounds(panRow.removeFromLeft(200));
+            panRow.removeFromLeft(12);
+            panEndSlider.setBounds(panRow.removeFromLeft(200));
+        }
+
+    private:
+        void setupSlider(juce::Slider& slider, float min, float max, float def, const juce::String& suffix)
+        {
+            slider.setRange(min, max, 0.1);
+            slider.setValue(def);
+            slider.setTextValueSuffix(" " + suffix);
+            slider.setSliderStyle(juce::Slider::LinearHorizontal);
+            slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 20);
+            slider.onValueChange = [this] { updateConfig(); };
+            addAndMakeVisible(slider);
+        }
+
+        void updateConfig()
+        {
+            currentConfig.type = static_cast<PercussionEngine::RollType>(rollTypeBox.getSelectedId() - 1);
+            currentConfig.pitchCurve = static_cast<PercussionEngine::PitchRampCurve>(pitchCurveBox.getSelectedId() - 1);
+            currentConfig.startPitchOffset = static_cast<float>(startPitchSlider.getValue());
+            currentConfig.endPitchOffset = static_cast<float>(endPitchSlider.getValue());
+            currentConfig.panStart = static_cast<float>(panStartSlider.getValue());
+            currentConfig.panEnd = static_cast<float>(panEndSlider.getValue());
+
+            if (onConfigChanged)
+                onConfigChanged(currentConfig);
+        }
+
+        int selectedStep = 0;
+        PercussionEngine::StepRollConfig currentConfig;
+
+        juce::ComboBox rollTypeBox;
+        juce::ComboBox pitchCurveBox;
+        juce::Slider startPitchSlider;
+        juce::Slider endPitchSlider;
+        juce::Slider panStartSlider;
+        juce::Slider panEndSlider;
+    };
+}
+
+```
+
+---
+
+## 4. Main Grid Component (`SequencerGridComponent.h`)
+
+Combines the 16 step buttons into beat groups (4 bars of 4 steps) and connects clicks directly to the `StepInspectorComponent`.
+
+```cpp
+#pragma once
+#include <JuceHeader.h>
+#include "StepButton.h"
+#include "StepInspectorComponent.h"
+#include "PluginProcessor.h"
+
+namespace PercussionUI
+{
+    class SequencerGridComponent : public juce::Component
+    {
+    public:
+        SequencerGridComponent(HiHatPercProgrammerAudioProcessor& p) : processor(p)
+        {
+            for (int i = 0; i < 16; ++i)
+            {
+                auto btn = std::make_unique<StepButton>(i);
+                btn->onClick = [this, i] { selectStep(i); };
+                stepButtons.add(std::move(btn));
+                addAndMakeVisible(stepButtons.getLast());
+            }
+
+            inspector.onConfigChanged = [this](const PercussionEngine::StepRollConfig& config) {
+                processor.setStepRollConfig(selectedStepIndex, config);
+                stepButtons[selectedStepIndex]->repaint();
+            };
+
+            addAndMakeVisible(inspector);
+            selectStep(0);
+        }
+
+        void selectStep(int index)
+        {
+            selectedStepIndex = index;
+            auto config = processor.getStepRollConfig(index);
+            inspector.inspectStep(index, config);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced(10);
+            
+            // Grid Top Layout (16 Steps split into 4 beat blocks)
+            auto gridArea = area.removeFromTop(70);
+            int stepWidth = (gridArea.getWidth() - (3 * 12)) / 16; // 12px gap between quarter-note beats
+
+            for (int i = 0; i < 16; ++i)
+            {
+                int beatSpacing = (i / 4) * 12; // Extra gap every 4th step
+                stepButtons[i]->setBounds(i * stepWidth + beatSpacing, 0, stepWidth - 2, 64);
+            }
+
+            area.removeFromTop(12);
+            inspector.setBounds(area);
+        }
+
+    private:
+        HiHatPercProgrammerAudioProcessor& processor;
+        juce::OwnedArray<StepButton> stepButtons;
+        StepInspectorComponent inspector;
+        int selectedStepIndex = 0;
+    };
+}
+
+```
+
+---
+
+## 5. Modern UI Styling Rules
+
+* **Visual Beat Separation:** Adding a wider pixel gap ($12\text{px}$) after steps 4, 8, and 12 instantly gives users visual feedback matching quarter-note time signatures.
+* **Color Hierarchy:**
+* Inactive Steps: `#1E222B` (Dark Slate)
+* Standard Active Steps: `#00E5FF` (Cyan Accent)
+* Roll Subdivisions & Pitch Sweeps: `#FF0055` (Hot Pink Badge)
