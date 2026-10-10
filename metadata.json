@@ -1,0 +1,6 @@
+{
+  "name": "Vintage Drum Machine Hi-Hat & Percussion Programmer",
+  "description": "Professional percussion & hi-hat programmer featuring vintage stepped sequencing, Web Audio DSP, micro-timing humanization, continuous openness, Trap rolls, local sample bank browser, and JUCE VST3 project export.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

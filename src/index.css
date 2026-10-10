@@ -1,0 +1,134 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+  
+  .font-mono-numbers {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Vintage drum machine tactile bevels & LED glow styling */
+.hardware-chassis {
+  background: radial-gradient(circle at 50% 0%, #252b36 0%, #161920 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 20px 40px -15px rgba(0, 0, 0, 0.7);
+}
+
+.vintage-panel-bevel {
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.6), 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.stepped-key {
+  transition: all 0.08s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 4px 0 #0d0f13, 0 6px 6px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.stepped-key:active {
+  transform: translateY(3px);
+  box-shadow: 0 1px 0 #0d0f13, 0 2px 2px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.stepped-key-down {
+  transform: translateY(2px);
+  box-shadow: 0 2px 0 #0d0f13, 0 3px 3px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.led-amber-glow {
+  box-shadow: 0 0 8px #f59e0b, 0 0 16px rgba(245, 158, 11, 0.4);
+}
+
+.led-orange-glow {
+  box-shadow: 0 0 8px #f97316, 0 0 16px rgba(249, 115, 22, 0.4);
+}
+
+.led-red-glow {
+  box-shadow: 0 0 8px #ef4444, 0 0 16px rgba(239, 68, 68, 0.5);
+}
+
+.led-cyan-glow {
+  box-shadow: 0 0 8px #06b6d4, 0 0 16px rgba(6, 182, 212, 0.5);
+}
+
+.led-green-glow {
+  box-shadow: 0 0 8px #10b981, 0 0 14px rgba(16, 185, 129, 0.6);
+}
+
+/* Modular Hardware Rack & Strip styling */
+.hardware-strip-panel {
+  background: linear-gradient(180deg, #181c26 0%, #131620 40%, #0d0f16 100%);
+  box-shadow: 
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 1px 0 0 rgba(255, 255, 255, 0.03),
+    inset -1px 0 0 rgba(0, 0, 0, 0.4),
+    0 8px 16px -4px rgba(0, 0, 0, 0.6);
+}
+
+.hardware-strip-active {
+  background: linear-gradient(180deg, #222838 0%, #171b26 40%, #10131b 100%);
+  box-shadow: 
+    inset 0 1px 0 rgba(251, 191, 36, 0.45),
+    inset 0 0 14px rgba(245, 158, 11, 0.1),
+    0 0 20px -3px rgba(245, 158, 11, 0.25);
+}
+
+.hardware-screw {
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, #444e63 0%, #181c26 100%);
+  border: 1px solid #4a566e;
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.12);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hardware-screw::after {
+  content: '';
+  width: 4px;
+  height: 1px;
+  background: #090b10;
+  transform: rotate(35deg);
+}
+
+.hardware-screw-alt::after {
+  transform: rotate(-55deg);
+}
+
+.hardware-fader-groove {
+  background: #08090e;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.9), 0 1px 0 rgba(255, 255, 255, 0.05);
+  border: 1px solid #1c212c;
+}
+
+.hardware-button {
+  background: linear-gradient(180deg, #242936 0%, #161922 100%);
+  border: 1px solid #333a4c;
+  box-shadow: 0 2px 0 #0c0e13, 0 3px 4px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  transition: all 0.08s ease;
+}
+
+.hardware-button:active {
+  transform: translateY(1px);
+  box-shadow: 0 1px 0 #0c0e13, 0 1px 2px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* Custom scrollbar for sample browser */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #161920;
+}
+::-webkit-scrollbar-thumb {
+  background: #2d3340;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f4759;
+}

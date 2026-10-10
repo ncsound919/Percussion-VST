@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for the Vintage Drum Machine Hi-Hat & Percussion Programmer featuring Web Audio DSP, local folder sound bank search browser, vintage stepped sequencer, DAW MIDI/WAV export, and complete JUCE C++ VST3 project generation.",
+  "updatedAt":  "2026-10-10T13:47:48.223060038Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
