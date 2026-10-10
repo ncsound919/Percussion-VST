@@ -1,0 +1,405 @@
+Here is a modular, production-ready C++ class architecture and core `AudioProcessor` implementation for building the hi-hat/percussion programmer in **JUCE**.
+
+---
+
+## 1. Engine Data Types & Data Structures (`PercussionEngineTypes.h`)
+
+Define lock-free event objects and data structures to represent incoming steps, dynamic parameters, and voice states.
+
+```cpp
+#pragma once
+#include <JuceHeader.h>
+
+namespace PercussionEngine
+{
+    // High-resolution percussion event passed from Sequencer to Synth
+    struct PercussionEvent
+    {
+        int sampleOffset = 0;             // Sample offset within current audio block
+        int instrumentId = 0;             // 0: Closed Hat, 1: Open Hat, 2: Perc, etc.
+        float velocity = 0.8f;            // 0.0f to 1.0f
+        float timingOffsetMs = 0.0f;      // Micro-timing offset (-20.0ms to +20.0ms)
+        float hatOpenness = 0.0f;         // 0.0f (Tight Closed) to 1.0f (Full Open)
+        float pitchShiftSemitones = 0.0f; // -12.0f to +12.0f
+        float pan = 0.0f;                 // -1.0f (Left) to +1.0f (Right)
+        int chokeGroup = 1;               // 0 = None, 1 = Hi-Hat Group
+    };
+
+    // Sequencer Step definition
+    struct SequencerStep
+    {
+        bool active = false;
+        float baseVelocity = 0.8f;
+        float probability = 1.0f;         // 0.0f to 1.0f trigger probability
+        int rollSubdivision = 1;          // 1 = normal, 2 = 32nd roll, 4 = 64th roll
+        float rollPitchRamp = 0.0f;       // Semitones to sweep across a roll
+        float hatOpenness = 0.0f;
+    };
+
+    // Parameters for humanization / drift
+    struct HumanizerParams
+    {
+        float timingJitterMs = 2.0f;      // Short-term random time offset
+        float timingDriftMs = 5.0f;       // LFO-based slow tempo drift
+        float velocityJitter = 0.05f;     // Random velocity fluctuation
+        float swingPercent = 50.0f;       // 50.0 = Straight, 66.6 = Triplet Swing
+    };
+}
+
+```
+
+---
+
+## 2. Multi-Zone Hi-Hat State Machine (`HatStateMachine.h`)
+
+Handles the continuous openness parameter ($0.0 - 1.0$) and evaluates choke events across active audio voices.
+
+```cpp
+#pragma once
+#include "PercussionEngineTypes.h"
+
+namespace PercussionEngine
+{
+    enum class HatZone
+    {
+        TightClosed,
+        LooseClosed,
+        HalfOpen,
+        FullOpen
+    };
+
+    class HatStateMachine
+    {
+    public:
+        HatStateMachine() = default;
+
+        // Maps continuous openness (0.0 to 1.0) to articulation zones
+        static HatZone getZoneFromOpenness(float openness)
+        {
+            if (openness < 0.2f) return HatZone::TightClosed;
+            if (openness < 0.5f) return HatZone::LooseClosed;
+            if (openness < 0.8f) return HatZone::HalfOpen;
+            return HatZone::FullOpen;
+        }
+
+        // Returns choke dampening multiplier for active open hat voices
+        float calculateChokeEnvelope(bool isChoking, float currentDampening, float releaseRate)
+        {
+            if (isChoking)
+            {
+                // Quick exponential dampening (2ms-5ms fast decay)
+                return currentDampening * releaseRate;
+            }
+            return 1.0f;
+        }
+    };
+}
+
+```
+
+---
+
+## 3. Humanizer & Timing Drift Engine (`Humanizer.h`)
+
+Combines white noise jitter with a Perlin-style LFO drift to simulate human drummer micro-timing.
+
+```cpp
+#pragma once
+#include <JuceHeader.h>
+#include "PercussionEngineTypes.h"
+
+namespace PercussionEngine
+{
+    class Humanizer
+    {
+    public:
+        Humanizer()
+        {
+            random.setSeedRandomly();
+        }
+
+        float calculateTimingOffset(const HumanizerParams& params, double currentPpq)
+        {
+            // 1. Short-term random jitter (-1.0 to 1.0)
+            float jitter = random.nextFloat() * 2.0f - 1.0f;
+            float jitterOffsetMs = jitter * params.timingJitterMs;
+
+            // 2. Long-term drift using low-frequency sine/LFO
+            float driftMs = std::sin(currentPpq * 0.25) * params.timingDriftMs;
+
+            return jitterOffsetMs + driftMs;
+        }
+
+        float calculateVelocityOffset(const HumanizerParams& params)
+        {
+            float jitter = random.nextFloat() * 2.0f - 1.0f;
+            return jitter * params.velocityJitter;
+        }
+
+    private:
+        juce::Random random;
+    };
+}
+
+```
+
+---
+
+## 4. Sequencer Engine (`SequencerEngine.h`)
+
+Tracks host PPQ (Pulse Per Quarter Note) position, evaluates probability/rolls, and schedules sample-accurate `PercussionEvent` objects into a fifo buffer.
+
+```cpp
+#pragma once
+#include <JuceHeader.h>
+#include "PercussionEngineTypes.h"
+#include "Humanizer.h"
+
+namespace PercussionEngine
+{
+    class SequencerEngine
+    {
+    public:
+        SequencerEngine() = default;
+
+        void prepare(double sampleRate, int maxBlockSize)
+        {
+            currentSampleRate = sampleRate;
+            juce::ignoreUnused(maxBlockSize);
+        }
+
+        // Main evaluation routine called inside AudioProcessor::processBlock
+        void processBlock(juce::AudioPlayHead* playHead, 
+                          int numSamples, 
+                          juce::Array<PercussionEvent>& outEventQueue)
+        {
+            if (playHead == nullptr) return;
+
+            auto positionOpt = playHead->getPosition();
+            if (!positionOpt.has_value()) return;
+
+            const auto& pos = *positionOpt;
+            if (!pos.getIsPlaying()) return;
+
+            double bpm = pos.getBpm().orFallback(120.0);
+            double ppqPosition = pos.getPpqPosition().orFallback(0.0);
+
+            double secondsPerQuarter = 60.0 / bpm;
+            double samplesPerQuarter = secondsPerQuarter * currentSampleRate;
+
+            // Compute block end position in PPQ
+            double quarterNotesInBlock = static_cast<double>(numSamples) / samplesPerQuarter;
+            double blockStartPpq = ppqPosition;
+            double blockEndPpq = blockStartPpq + quarterNotesInBlock;
+
+            // Evaluate 16th-note steps within this block range
+            double ppqPer16th = 0.25; // 1/4 of a quarter note
+            int startStep = static_cast<int>(std::floor(blockStartPpq / ppqPer16th));
+            int endStep = static_cast<int>(std::ceil(blockEndPpq / ppqPer16th));
+
+            for (int step = startStep; step <= endStep; ++step)
+            {
+                double stepPpq = step * ppqPer16th;
+
+                // Check if step falls within the current audio block boundary
+                if (stepPpq >= blockStartPpq && stepPpq < blockEndPpq)
+                {
+                    int stepIndexInPattern = step % 16;
+                    const auto& patternStep = pattern[stepIndexInPattern];
+
+                    if (patternStep.active && random.nextFloat() <= patternStep.probability)
+                    {
+                        PercussionEvent evt;
+                        
+                        // Calculate sample offset within current block
+                        double ppqOffset = stepPpq - blockStartPpq;
+                        evt.sampleOffset = juce::jlimit(0, numSamples - 1, static_cast<int>(ppqOffset * samplesPerQuarter));
+                        
+                        // Apply Humanization & Micro-timing
+                        float microTimingMs = humanizer.calculateTimingOffset(humanizerParams, stepPpq);
+                        int sampleJitter = static_cast<int>((microTimingMs / 1000.0) * currentSampleRate);
+                        evt.sampleOffset = juce::jlimit(0, numSamples - 1, evt.sampleOffset + sampleJitter);
+
+                        evt.velocity = juce::jlimit(0.0f, 1.0f, patternStep.baseVelocity + humanizer.calculateVelocityOffset(humanizerParams));
+                        evt.hatOpenness = patternStep.hatOpenness;
+                        evt.chokeGroup = 1;
+
+                        outEventQueue.add(evt);
+                    }
+                }
+            }
+        }
+
+        void setStep(int index, const SequencerStep& step) { pattern[index] = step; }
+
+    private:
+        double currentSampleRate = 44100.0;
+        SequencerStep pattern[16];
+        Humanizer humanizer;
+        HumanizerParams humanizerParams;
+        juce::Random random;
+    };
+}
+
+```
+
+---
+
+## 5. Main JUCE AudioProcessor Implementation (`PluginProcessor.h` & `PluginProcessor.cpp`)
+
+Integrates host sync, parameter management, MIDI output generation, and audio rendering.
+
+### `PluginProcessor.h`
+
+```cpp
+#pragma once
+#include <JuceHeader.h>
+#include "Engine/PercussionEngineTypes.h"
+#include "Engine/SequencerEngine.h"
+#include "Engine/HatStateMachine.h"
+
+class HiHatPercProgrammerAudioProcessor : public juce::AudioProcessor
+{
+public:
+    HiHatPercProgrammerAudioProcessor();
+    ~HiHatPercProgrammerAudioProcessor() override;
+
+    void prepareToPlay(double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;
+    void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override;
+
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override { return true; }
+
+    const juce::String getName() const override { return "HiHat Perc Programmer"; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return true; }
+    bool isMidiEffect() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }
+
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return "Default"; }
+    void changeProgramName(int, const juce::String&) override {}
+
+    void getStateInformation(juce::MemoryBlock& destData) override;
+    void setStateInformation(const void* data, int sizeInBytes) override;
+
+    juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
+
+private:
+    juce::AudioProcessorValueTreeState apvts;
+    juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    PercussionEngine::SequencerEngine sequencer;
+    PercussionEngine::HatStateMachine hatStateMachine;
+    juce::Array<PercussionEngine::PercussionEvent> eventQueue;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HiHatPercProgrammerAudioProcessor)
+};
+
+```
+
+### `PluginProcessor.cpp`
+
+```cpp
+#include "PluginProcessor.h"
+
+HiHatPercProgrammerAudioProcessor::HiHatPercProgrammerAudioProcessor()
+    : AudioProcessor(BusesProperties()
+        .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts(*this, nullptr, "Parameters", createParameterLayout())
+{
+    // Initialize default 16th pattern
+    for (int i = 0; i < 16; ++i)
+    {
+        PercussionEngine::SequencerStep step;
+        step.active = (i % 2 == 0); // Active on 8th notes
+        step.baseVelocity = (i % 4 == 0) ? 1.0f : 0.6f; // Accents on downbeats
+        step.probability = 1.0f;
+        step.hatOpenness = (i == 14) ? 0.9f : 0.0f; // Open hat on step 14
+        sequencer.setStep(i, step);
+    }
+}
+
+HiHatPercProgrammerAudioProcessor::~HiHatPercProgrammerAudioProcessor() = default;
+
+juce::AudioProcessorValueTreeState::ParameterLayout HiHatPercProgrammerAudioProcessor::createParameterLayout()
+{
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{"swing", 1}, "Swing %", 50.0f, 75.0f, 50.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{"jitter", 1}, "Timing Jitter (ms)", 0.0f, 15.0f, 2.0f));
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{"hatOpenness", 1}, "Global Hat Openness", 0.0f, 1.0f, 0.0f));
+
+    return { params.begin(), params.end() };
+}
+
+void HiHatPercProgrammerAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+{
+    sequencer.prepare(sampleRate, samplesPerBlock);
+    eventQueue.ensureStorageAllocated(64);
+}
+
+void HiHatPercProgrammerAudioProcessor::releaseResources() {}
+
+void HiHatPercProgrammerAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+{
+    juce::ScopedNoDenormals noDenormals;
+    buffer.clear();
+    eventQueue.clearQuick();
+
+    // 1. Evaluate Pattern Sequencer against Host Playhead
+    sequencer.processBlock(getPlayHead(), buffer.getNumSamples(), eventQueue);
+
+    // 2. Convert scheduled events into outgoing MIDI events for host/VST routing
+    for (const auto& evt : eventQueue)
+    {
+        // Map instrumentId/openness to MIDI notes
+        // Note 42 = Closed Hi-Hat, Note 46 = Open Hi-Hat
+        int midiNote = (evt.hatOpenness > 0.5f) ? 46 : 42;
+        uint8_t midiVel = static_cast<uint8_t>(evt.velocity * 127.0f);
+
+        auto noteOn = juce::MidiMessage::noteOn(1, midiNote, midiVel);
+        auto noteOff = juce::MidiMessage::noteOff(1, midiNote);
+
+        midiMessages.addEvent(noteOn, evt.sampleOffset);
+        // Schedule note off 100 samples later for clean triggering
+        midiMessages.addEvent(noteOff, juce::jmin(buffer.getNumSamples() - 1, evt.sampleOffset + 100));
+    }
+}
+
+juce::AudioProcessorEditor* HiHatPercProgrammerAudioProcessor::createEditor()
+{
+    return new juce::GenericAudioProcessorEditor(*this);
+}
+
+void HiHatPercProgrammerAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
+{
+    auto state = apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml(state.createXml());
+    copyXmlToBinary(*xml, destData);
+}
+
+void HiHatPercProgrammerAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
+{
+    std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
+    if (xmlState != nullptr && xmlState->hasTagName(apvts.state.getType()))
+    {
+        apvts.replaceState(juce::ValueTree::fromXml(*xmlState));
+    }
+}
+
+// JUCE Plugin Entry Point
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new HiHatPercProgrammerAudioProcessor();
+}
+
+```
+
+---
