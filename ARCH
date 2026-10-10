@@ -1,0 +1,146 @@
+Here is a high-level software architecture comparison and technical blueprint for implementing the programmer in either **Web Audio API + WebAssembly (AudioWorklet)** or **JUCE (C++)**.
+
+---
+
+## 1. Stack Comparison & Recommendation
+
+| Criteria | Web Stack (Web Audio + WebAssembly / C++) | Desktop Native (JUCE C++) |
+| --- | --- | --- |
+| **Target Deliverable** | Web app, browser-based generator, PWAs | VST3 / AU / AAX plugin, standalone app |
+| **DAW Integration** | Limited (MIDI export, Web MIDI out, virtual cabling) | Native sample-accurate DAW clock/MIDI drag-and-drop |
+| **Real-time Performance** | Excellent via `AudioWorkletNode` + Wasm | Industry standard, zero-garbage-collection C++ |
+| **File I/O & Storage** | Web File System Access API, IndexedDB | Direct filesystem access, native sample playback |
+
+* **Choose Web Audio API** if your primary goal is rapid distribution, zero-install accessibility, web-based MIDI export/generation, or cross-platform browser deployment.
+* **Choose JUCE C++** if your primary goal is an in-DAW VST3/AU plugin with sample-accurate host synchronization, multi-out routing, and native CPU performance.
+
+---
+
+## 2. Core System Architecture
+
+Both implementations use a decoupled **Three-Tier Model** to guarantee that pattern generation or UI rendering never blocks audio generation or sample playback.
+
+```
+       ┌────────────────────────────────────────────────────────┐
+       │               UI / Visualizer Layer                    │
+       │   (Step Sequencer, Controls, Waveform Display)        │
+       └───────────────────────────┬────────────────────────────┘
+                                   │ Lock-free Ring Buffer / 
+                                   │ SharedArrayBuffer Messaging
+                                   ▼
+       ┌────────────────────────────────────────────────────────┐
+       │             Sequencing & Engine Core                   │
+       │   - Pattern Memory & Clave/Grid Rules Engine          │
+       │   - Micro-Timing & Jitter Offset Generator             │
+       │   - Humanization & Velocity Curves                     │
+       └───────────────────────────┬────────────────────────────┘
+                                   │ Sample-Accurate Events
+                                   │ (MIDI / Trigger Queues)
+                                   ▼
+       ┌────────────────────────────────────────────────────────┐
+       │              Audio / Output Processor                  │
+       │   - Multi-Zone Hi-Hat State Engine (Open/Closed)       │
+       │   - Sample Voice Allocation & Choke Groups             │
+       │   - DSP (Filters, Pitch Envelopes, Pan, Volume)        │
+       └────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## 3. Web Audio API Architecture Spec
+
+### Component Breakdown
+
+1. **Main Thread (UI/Logic):** React/Svelte UI + Sequencer State. Communicates with the audio thread via `MessagePort` using `SharedArrayBuffer` or structured cloning.
+2. **Audio Worklet (`AudioWorkletProcessor`):** Runs on a dedicated real-time audio rendering thread. Houses the sequencer clock, pattern scheduler, and sample synth engine.
+3. **Wasm Layer (Optional Optimization):** Compiled C/C++ or Rust handling complex pattern generation, Perlin noise humanization, and dynamic pitch/stretch DSP.
+
+### Data Flow & Scheduling Logic
+
+In Web Audio, `setTimeout` / `setInterval` are not clock-accurate. Use the **Lookahead Scheduler** pattern:
+
+* A timer loop on the main thread fires every $25\text{ ms}$.
+* It schedules audio events falling within the next $100\text{ ms}$ window using precise `AudioContext.currentTime` values.
+
+```javascript
+// High-Level AudioWorklet Sequencer Core Concept
+class PercussionWorkletProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.sampleBufferMap = new Map(); // Pre-decoded Float32Array samples
+    this.voiceQueue = [];             // Active playback voices
+    this.port.onmessage = this.handleMessage.bind(this);
+  }
+
+  handleMessage(event) {
+    const { type, payload } = event.data;
+    if (type === 'SCHEDULE_EVENT') {
+      this.queueEvent(payload);
+    }
+  }
+
+  process(inputs, outputs, parameters) {
+    const output = outputs[0];
+    const numSamples = output[0].length; // Typically 128 samples per block
+
+    // Render active voices into buffer
+    this.renderVoices(output, numSamples);
+    return true;
+  }
+}
+
+registerProcessor('percussion-worklet-processor', PercussionWorkletProcessor);
+
+```
+
+---
+
+## 4. JUCE C++ Architecture Spec
+
+### Class Structure
+
+```
+MyPercussionEngine/
+├── Source/
+│   ├── PluginProcessor.h/cpp   <-- AudioProcessor (Host sync, MIDI out)
+│   ├── PluginEditor.h/cpp      <-- AudioProcessorEditor (JUCE UI)
+│   ├── Engine/
+│   │   ├── SequencerEngine.h   <-- Pattern evaluation & tempo lock
+│   │   ├── Humanizer.h         <-- Timing drift, jitter & velocity curves
+│   │   └── StateMachine.h      <-- Hat openness (0.0 to 1.0) & choke groups
+│   ├── Audio/
+│   │   ├── SampleVoice.h       <-- Individual playback voice DSP
+│   │   └── SamplerSound.h       <-- Multi-zone sample mapping (Tip/Shank)
+│   └── Utils/
+│       └── LockFreeQueue.h     <-- Producer/Consumer thread-safe buffers
+
+```
+
+### Key Technical Considerations
+
+* **Sample-Accurate Host Sync:** Use `juce::AudioPlayHead` within `processBlock()` to query tempo, time signature, and transport position (`ppqPosition`).
+* **Choke Group Implementation:** When a closed hi-hat event triggers, iterate active voices in the same choke group and execute a fast decay envelope ($2\text{--}5\text{ ms}$) to prevent audio pops while stopping the voice.
+* **Lock-Free Messaging:** Use `juce::AbstractFifo` or `farbot::fifo` to pass parameter updates from the Editor thread to the Processor thread without lock contention.
+
+---
+
+## 5. Hi-Hat State Engine Data Model
+
+Below is a state tracking model applicable to both C++ and TypeScript:
+
+```typescript
+interface PercussionEvent {
+  step: number;               // Step index (e.g., 0-15 for 16th notes)
+  instrumentId: string;       // e.g., "hihat", "cabasa", "agogo"
+  subdivision: number;        // 1 = normal, 2 = 32nd roll, 4 = 64th roll, etc.
+  velocity: number;           // 0.0 - 1.0
+  timingOffsetMs: number;     // Micro-timing offset (-20ms to +20ms)
+  hatOpenness: number;        // 0.0 (Tight Closed) to 1.0 (Full Open)
+  pitchShiftSemitones: number;// e.g., -12 to +12 for Trap rolls
+  pan: number;                // -1.0 (Left) to +1.0 (Right)
+}
+
+```
+
+---
